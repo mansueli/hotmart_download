@@ -1,0 +1,17 @@
+old/
+outputs/
+cookies.json
+__pycache__/
+*.pyc
+.venv/
+network_log.txt
+videos/
+transcripts/
+first_aid_*/
+*.mp4
+*.srt
+*.vtt
+*.wav
+*.pdf
+COURSE_TRANSCRIPT.md
+FIRST_AID_COURSE_TRANSCRIPT.md
