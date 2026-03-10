@@ -10,10 +10,11 @@ import asyncio
 import json
 import os
 import re
+import time
 import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 try:
     from playwright.async_api import async_playwright, Page, Browser
@@ -24,6 +25,41 @@ except ImportError:
     print("pip install playwright aiohttp")
     print("playwright install chromium")
     sys.exit(1)
+
+
+def format_size(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB"]
+    size = float(max(num_bytes, 0))
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def load_failed_downloads(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cleaned = {}
+    for content_id, details in data.items():
+        if isinstance(content_id, str) and isinstance(details, dict):
+            cleaned[content_id] = details
+    return cleaned
+
+
+def write_failed_downloads(path: Path, failed_downloads: Dict[str, Dict[str, Any]]) -> None:
+    if failed_downloads:
+        path.write_text(json.dumps(failed_downloads, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
 
 
 class HotmartVideoDownloader:
@@ -43,9 +79,60 @@ class HotmartVideoDownloader:
         self.video_urls: List[Dict[str, str]] = []
         self.video_urls: List[Dict[str, str]] = []
         self.content_ids: List[str] = []
+        self.content_metadata: Dict[str, Dict[str, str]] = {}
         self.current_content_id: Optional[str] = None
         # Store list of dicts: [{'url': url, 'headers': headers}]
         self.video_urls_by_id: Dict[str, List[Dict]] = {}
+        self.failed_downloads_path = self.output_dir / "FAILED_DOWNLOADS.json"
+        self.failed_downloads = load_failed_downloads(self.failed_downloads_path)
+
+    def _save_failed_downloads(self) -> None:
+        write_failed_downloads(self.failed_downloads_path, self.failed_downloads)
+
+    def mark_download_failed(self, content_id: str, title: str, reason: str) -> None:
+        self.failed_downloads[content_id] = {
+            "title": title,
+            "reason": reason,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        self._save_failed_downloads()
+
+    def clear_failed_download(self, content_id: str) -> None:
+        if content_id in self.failed_downloads:
+            self.failed_downloads.pop(content_id, None)
+            self._save_failed_downloads()
+
+    def build_output_filename(self, item: Dict[str, Any], index: int) -> str:
+        file_name = item.get("file_name")
+        if file_name:
+            return file_name
+        safe_title = re.sub(r'[^\w\s-]', '', item['title']).strip()
+        safe_title = re.sub(r'[-\s]+', '-', safe_title)
+        filename = f"{index:03d}_{item['id']}_{safe_title}.mp4"
+        return filename[:200]
+
+    async def wait_for_ffmpeg(self, process, output_path: Path, filename: str):
+        stdout_task = asyncio.create_task(process.stdout.read())
+        stderr_task = asyncio.create_task(process.stderr.read())
+        wait_task = asyncio.create_task(process.wait())
+        started_at = time.monotonic()
+
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=10)
+                break
+            except asyncio.TimeoutError:
+                written = output_path.stat().st_size if output_path.exists() else 0
+                elapsed = int(time.monotonic() - started_at)
+                print(
+                    f"  ... still downloading {filename} ({elapsed}s elapsed, {format_size(written)} written)",
+                    flush=True,
+                )
+
+        stdout = await stdout_task
+        stderr = await stderr_task
+        await wait_task
+        return stdout, stderr
         
     async def extract_content_ids_from_html(self, html_file: Optional[str] = None) -> List[str]:
         """
@@ -269,7 +356,7 @@ class HotmartVideoDownloader:
         
         # Method 3: Execute JavaScript to find video URLs
         try:
-            video_url = await page.evaluate("""
+            video_url = await page.evaluate(r"""
                 () => {
                     // Look for video element
                     const video = document.querySelector('video');
@@ -390,8 +477,7 @@ class HotmartVideoDownloader:
                 stderr=asyncio.subprocess.PIPE
             )
             
-            # Wait for completion
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await self.wait_for_ffmpeg(process, output_path, filename)
             
             if process.returncode == 0:
                 print(f"  ✓ Downloaded: {filename}")
@@ -399,10 +485,13 @@ class HotmartVideoDownloader:
             else:
                 print(f"  ✗ Failed to download: {filename}")
                 print(f"  ffmpeg stderr: {stderr.decode()[-500:]}")
+                output_path.unlink(missing_ok=True)
                 return False
                 
         except Exception as e:
             print(f"  ✗ Error downloading with ffmpeg: {e}")
+            output_path = self.output_dir / filename
+            output_path.unlink(missing_ok=True)
             return False
 
     async def run(
@@ -423,6 +512,15 @@ class HotmartVideoDownloader:
         print("Starting Hotmart Video Downloader")
         print(f"Product URL: {self.product_url}")
         print(f"Output directory: {self.output_dir}")
+        if self.failed_downloads:
+            print(f"Retry ledger contains {len(self.failed_downloads)} previous failed download(s)")
+        stats = {
+            'processed': 0,
+            'downloaded': 0,
+            'skipped': 0,
+            'failed': 0,
+            'retried': 0,
+        }
         
         # Extract content IDs from HTML or content_ids.txt if available
         if self.content_ids:
@@ -515,7 +613,7 @@ class HotmartVideoDownloader:
             if titles_only:
                 await browser.close()
                 print("Titles-only mode enabled; stopping after saving titles.")
-                return
+                return stats
             
             # If we have specific content IDs, use those instead of scraping
             if self.content_ids:
@@ -524,7 +622,8 @@ class HotmartVideoDownloader:
                 content_items = [
                     {
                         'id': cid,
-                        'title': f"Content {cid}",
+                        'title': self.content_metadata.get(cid, {}).get('title', f"Content {cid}"),
+                        'file_name': self.content_metadata.get(cid, {}).get('video_file_name'),
                         'url': f"{base_url}/content/{cid}"
                     }
                     for cid in self.content_ids
@@ -535,7 +634,7 @@ class HotmartVideoDownloader:
                 print("1. You're logged in to Hotmart")
                 print("2. You have access to the course")
                 print("3. The URL is correct")
-                return
+                return stats
             
             print(f"\nFound {len(content_items)} content items to process")
             
@@ -557,15 +656,23 @@ class HotmartVideoDownloader:
 
             # Process each content item
             for i, item in enumerate(content_items, 1):
+                stats['processed'] += 1
                 print(f"\n[{i}/{len(content_items)}] Processing: {item['title']}")
+                if item['id'] in self.failed_downloads:
+                    stats['retried'] += 1
+                    print(f"  Retrying previous failure: {self.failed_downloads[item['id']].get('reason', 'unknown error')}")
+                target_filename = self.build_output_filename(item, i)
+                target_path = self.output_dir / target_filename
                 
                 # Check if we already have this video downloaded
-                safe_title = re.sub(r'[^\w\s-]', '', item['title']).strip()
-                safe_title = re.sub(r'[-\s]+', '-', safe_title)
-                # Simple check pattern - specific filename might vary but content_id is key
-                existing_files = list(self.output_dir.glob(f"*_{item['id']}_*.mp4"))
+                existing_files = [target_path] if target_path.exists() else list(self.output_dir.glob(f"*_{item['id']}_*.mp4"))
                 if existing_files:
+                    if existing_files[0] != target_path and not target_path.exists():
+                        existing_files[0].rename(target_path)
+                        existing_files = [target_path]
                     print(f"  ✓ Video already downloaded: {existing_files[0].name}")
+                    stats['skipped'] += 1
+                    self.clear_failed_download(item['id'])
                     continue
                 
                 # Check if we already have the URL for this content but maybe download failed
@@ -577,28 +684,33 @@ class HotmartVideoDownloader:
                     title = existing_url_entry['title']
                     content_id = existing_url_entry['content_id'] 
                     headers = existing_url_entry.get('headers')
-                    
-                    extension = 'mp4'
-                    filename = f"{i:03d}_{content_id}_{safe_title}.{extension}"
-                    filename = filename[:200]
+                    downloaded_now = False
+                    filename = target_filename
                     
                     download_success = False
                     if url.endswith('.m3u8') or '.m3u8' in url:
                         filename_mp4 = filename.rsplit('.', 1)[0] + '.mp4'
                         if not (self.output_dir / filename_mp4).exists():
                             download_success = await self.download_with_ffmpeg(url, filename_mp4, headers)
+                            downloaded_now = download_success
                         else:
                              print(f"  ✓ File exists: {filename_mp4}")
+                             stats['skipped'] += 1
                              download_success = True
                     else:
                         if not (self.output_dir / filename).exists():
                             async with aiohttp.ClientSession() as session:
                                 download_success = await self.download_video(session, url, filename)
+                                downloaded_now = download_success
                         else:
                              print(f"  ✓ File exists: {filename}")
+                             stats['skipped'] += 1
                              download_success = True
                     
                     if download_success:
+                        if downloaded_now:
+                            stats['downloaded'] += 1
+                        self.clear_failed_download(item['id'])
                         continue
                     else:
                         print("  ! Cached URL failed (likely expired). Re-scanning page...")
@@ -607,6 +719,8 @@ class HotmartVideoDownloader:
 
                 try:
                     self.current_content_id = item['id']
+                    item_succeeded = False
+                    failure_reason = "No playable stream found"
                     
                     # Navigate to content page
                     await page.goto(item['url'], wait_until="domcontentloaded", timeout=60000)
@@ -643,29 +757,30 @@ class HotmartVideoDownloader:
                             title = item['title']
                             content_id = item['id']
                             headers = stream['headers']
+                            filename = target_filename
                             
-                            safe_title = re.sub(r'[^\w\s-]', '', title).strip()
-                            safe_title = re.sub(r'[-\s]+', '-', safe_title)
-                            filename = f"{i:03d}_{content_id}_{safe_title}.mp4"
-                            filename = filename[:200]
-                            
-                            await self.download_with_ffmpeg(url, filename, headers)
+                            if await self.download_with_ffmpeg(url, filename, headers):
+                                item_succeeded = True
+                                stats['downloaded'] += 1
+                                failure_reason = ""
                             
                     elif video_url: # Blob or other direct URL found via JS
                         print(f"  Found video via JS: {video_url}")
                         if video_url.startswith("blob:"):
-                            pass
+                            failure_reason = "Video URL was a blob URL and could not be downloaded directly"
                         else:
                             url = video_url
                             title = item['title']
                             content_id = item['id']
-                            safe_title = re.sub(r'[^\w\s-]', '', title).strip()
-                            safe_title = re.sub(r'[-\s]+', '-', safe_title)
-                            filename = f"{i:03d}_{content_id}_{safe_title}.mp4"
-                            filename = filename[:200]
+                            filename = target_filename
                             if not (self.output_dir / filename).exists():
                                 async with aiohttp.ClientSession() as session:
-                                    await self.download_video(session, url, filename)
+                                    if await self.download_video(session, url, filename):
+                                        item_succeeded = True
+                                        stats['downloaded'] += 1
+                                        failure_reason = ""
+                                    else:
+                                        failure_reason = "Direct video download failed"
                     else:
                         print(f"  No m3u8 stream found yet")
                         
@@ -709,11 +824,11 @@ class HotmartVideoDownloader:
                                     title = item['title']
                                     content_id = item['id']
                                     headers = stream['headers']
-                                    safe_title = re.sub(r'[^\w\s-]', '', title).strip()
-                                    safe_title = re.sub(r'[-\s]+', '-', safe_title)
-                                    filename = f"{i:03d}_{content_id}_{safe_title}.mp4"
-                                    filename = filename[:200]
-                                    await self.download_with_ffmpeg(url, filename, headers)
+                                    filename = target_filename
+                                    if await self.download_with_ffmpeg(url, filename, headers):
+                                        item_succeeded = True
+                                        stats['downloaded'] += 1
+                                        failure_reason = ""
                         except:
                             pass
                     
@@ -722,9 +837,17 @@ class HotmartVideoDownloader:
                         with open(urls_file, 'w') as f:
                             json.dump(all_video_urls, f, indent=2)
                             print(f"  Saved progress to video_urls.json")
+
+                    if item_succeeded:
+                        self.clear_failed_download(item['id'])
+                    else:
+                        stats['failed'] += 1
+                        self.mark_download_failed(item['id'], item['title'], failure_reason)
                 
                 except Exception as e:
                     print(f"  Error processing {item['title']}: {e}")
+                    stats['failed'] += 1
+                    self.mark_download_failed(item['id'], item['title'], str(e))
                     continue
             
             # Also collect intercepted URLs (legacy/fallback)
@@ -737,6 +860,7 @@ class HotmartVideoDownloader:
                     })
             
             await browser.close()
+            return stats
             
             print(f"\n\n✓ Processing complete! Videos saved to: {self.output_dir}")
 

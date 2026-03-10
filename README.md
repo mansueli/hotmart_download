@@ -1,17 +1,18 @@
 # Hotmart Course Downloader + Transcriber
 
-End-to-end pipeline to download Hotmart course videos and materials, then build a full transcript with module + lesson titles. Input is just the product id (e.g. `4459938`) and the tool resumes safely on re-runs.
+End-to-end pipeline to download Hotmart course videos and materials, then build a full transcript with module + lesson titles. Use the full Hotmart course URL on first run, and the tool resumes safely on re-runs.
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-python run_course.py 4459938
+python run_course.py "https://hotmart.com/pt-br/club/<club-slug>/products/4459938"
 ```
 
 On first run (or if cookies are expired), a browser window opens so you can complete Google authentication. Once logged in, cookies are saved to `cookies.json` automatically and used for future runs.
 The repository `.gitignore` keeps cookies, outputs, and large media out of version control.
+The runner now checks for required external tools before doing any login or download work.
 
 ## What It Produces
 
@@ -23,6 +24,7 @@ Output goes to `outputs/<product_id>/`:
 - `course_manifest.json` source-of-truth manifest (modules, lessons, attachments)
 - `state.json` resumable status snapshot
 - `COURSE_TRANSCRIPT.md` combined transcript
+- `videos/FAILED_DOWNLOADS.json` retry ledger for video download failures
 
 ## Resuming Behavior
 
@@ -30,14 +32,15 @@ The pipeline is idempotent:
 
 - existing videos/attachments are skipped
 - existing transcripts are skipped
+- failed video downloads are tracked in `videos/FAILED_DOWNLOADS.json`
 - failures are logged to `transcripts/FAILED_ITEMS.txt`
 
-Re-run `python run_course.py <product_id>` to resume from the last successful item.
+Re-run with the same full URL, or just the product id after the first successful run once the canonical URL has been cached in `course_manifest.json`.
 
 ## Flags
 
 ```bash
-python run_course.py 4459938 \
+python run_course.py "https://hotmart.com/pt-br/club/<club-slug>/products/4459938" \
   --output-dir outputs \
   --cookies cookies.json \
   --refresh-manifest \
@@ -74,6 +77,11 @@ python -m unittest discover -s tests
 
 - Output transcripts include module + lesson titles to disambiguate repeated lesson names.
 - Attachments are included in the combined transcript (PDFs via `pdftotext`).
+- Long `ffmpeg` downloads emit periodic "still downloading" heartbeat lines with elapsed time and bytes written.
+- End-of-run logs include a summary of videos downloaded this run, skipped existing files, retries, and remaining failed downloads.
+- Video files use title-based names that keep the lesson order, for example `001 - Lesson Title.mp4`.
+- Generic lesson titles automatically include the module name to keep filenames distinct.
+- Attachment files also use readable title-based names that keep the lesson order.
 
 ## Legacy Scripts
 

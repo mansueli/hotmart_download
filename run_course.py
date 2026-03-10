@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,95 @@ ATTACHMENT_DOWNLOAD_URL = (
 )
 
 
+def log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def ensure_dependencies(args: argparse.Namespace) -> None:
+    missing = []
+    if not shutil.which("ffmpeg"):
+        missing.append("ffmpeg (install with: brew install ffmpeg)")
+    if not shutil.which("pdftotext"):
+        missing.append("pdftotext (install with: brew install poppler)")
+    if args.auth_browser == "system":
+        try:
+            find_chrome_binary(args.chrome_bin)
+        except RuntimeError as exc:
+            missing.append(str(exc))
+    if missing:
+        details = "\n".join(f"- {item}" for item in missing)
+        raise SystemExit(f"Missing required external dependencies:\n{details}")
+
+
+def merge_video_stats(*stats_list: Optional[Dict[str, int]]) -> Dict[str, int]:
+    merged = {"processed": 0, "downloaded": 0, "skipped": 0, "failed": 0, "retried": 0}
+    for stats in stats_list:
+        if not stats:
+            continue
+        for key in merged:
+            merged[key] += int(stats.get(key, 0))
+    return merged
+
+
+def load_failed_video_downloads(videos_dir: Path) -> Dict[str, Any]:
+    failed_path = videos_dir / "FAILED_DOWNLOADS.json"
+    if not failed_path.exists():
+        return {}
+    try:
+        payload = json.loads(failed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def log_pipeline_summary(
+    manifest: Dict[str, Any],
+    videos_dir: Path,
+    materials_dir: Path,
+    transcripts_dir: Path,
+    video_stats: Dict[str, int],
+) -> None:
+    total_video_items = sum(1 for item in manifest["items"] if item.get("has_media"))
+    downloaded_videos = sum(
+        1 for item in manifest["items"] if find_video_file_for_item(item, videos_dir)
+    )
+    failed_video_downloads = load_failed_video_downloads(videos_dir)
+    remaining_video_failures = len(failed_video_downloads)
+    total_attachments = sum(len(item.get("attachments") or []) for item in manifest["items"])
+    downloaded_attachments = sum(
+        1
+        for item in manifest["items"]
+        for attachment in item.get("attachments") or []
+        if (materials_dir / attachment.get("local_name", "")).exists()
+    )
+    total_video_transcripts = len(list(transcripts_dir.glob("*.mp4.txt")))
+    total_attachment_transcripts = sum(
+        1
+        for item in manifest["items"]
+        for attachment in item.get("attachments") or []
+        if attachment.get("local_name")
+        and (transcripts_dir / f"{attachment['local_name']}.txt").exists()
+    )
+
+    log("Run summary")
+    log(
+        "Videos: "
+        f"{downloaded_videos}/{total_video_items} present, "
+        f"{video_stats['downloaded']} downloaded this run, "
+        f"{video_stats['skipped']} skipped existing, "
+        f"{video_stats['retried']} retried, "
+        f"{remaining_video_failures} remaining in FAILED_DOWNLOADS.json"
+    )
+    log(
+        "Attachments: "
+        f"{downloaded_attachments}/{total_attachments} files present"
+    )
+    log(
+        "Transcripts: "
+        f"{total_video_transcripts} video, {total_attachment_transcripts} attachment"
+    )
+
+
 def parse_product_id(value: str) -> str:
     value = value.strip()
     if value.isdigit():
@@ -32,15 +122,40 @@ def parse_product_id(value: str) -> str:
     raise SystemExit("Could not parse product id from input.")
 
 
-def build_product_url(product_id: str) -> str:
-    return f"https://hotmart.com/pt-br/club/products/{product_id}"
+def normalize_product_url(url: str) -> str:
+    return url.split("?", 1)[0].rstrip("/")
 
 
-def resolve_product_url(value: str, product_id: str) -> str:
+def load_cached_product_url(output_root: Path) -> Optional[str]:
+    manifest_path = output_root / "course_manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    product_url = manifest.get("product_url")
+    if isinstance(product_url, str) and "/products/" in product_url:
+        return normalize_product_url(product_url)
+    return None
+
+
+def missing_product_url_error(product_id: str) -> SystemExit:
+    return SystemExit(
+        "Hotmart requires the full course URL for browser navigation. "
+        f"Rerun with the complete URL, for example: "
+        f"https://hotmart.com/pt-br/club/<club-slug>/products/{product_id}"
+    )
+
+
+def resolve_product_url(value: str, product_id: str, output_root: Path) -> str:
     value = value.strip()
     if "/products/" in value:
-        return value.split("?")[0].rstrip("/")
-    return build_product_url(product_id)
+        return normalize_product_url(value)
+    cached_url = load_cached_product_url(output_root)
+    if cached_url:
+        return cached_url
+    raise missing_product_url_error(product_id)
 
 
 def find_chrome_binary(explicit_path: Optional[str] = None) -> str:
@@ -145,6 +260,159 @@ def safe_filename(name: str) -> str:
     return base
 
 
+def safe_display_filename(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace("/", " - ").replace("\\", " - ")
+    ascii_name = re.sub(r"[^A-Za-z0-9 ._-]+", "", ascii_name)
+    ascii_name = re.sub(r"\s+", " ", ascii_name).strip()
+    ascii_name = re.sub(r"\s*-\s*", " - ", ascii_name)
+    ascii_name = re.sub(r"( - ){2,}", " - ", ascii_name)
+    return ascii_name or "Content"
+
+
+def normalize_name_for_comparison(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_name.lower()).strip()
+
+
+def lesson_title_needs_module(item: Dict[str, Any]) -> bool:
+    lesson = normalize_name_for_comparison(str(item.get("lesson") or ""))
+    module = normalize_name_for_comparison(str(item.get("module") or ""))
+    if not lesson:
+        return False
+    generic_titles = {
+        "introducao",
+        "introduction",
+        "bonus",
+        "conteudo",
+        "content",
+        "ebook",
+        "aula",
+        "lesson",
+    }
+    if lesson in generic_titles:
+        return True
+    if re.fullmatch(r"(aula|lesson|content|conteudo) \d+", lesson):
+        return True
+    if len(lesson) <= 8:
+        return True
+    if module and lesson == module:
+        return True
+    return False
+
+
+def build_content_base_name(item: Dict[str, Any]) -> str:
+    lesson = safe_display_filename(str(item.get("lesson") or f"Content {item['content_id']}"))
+    module = safe_display_filename(str(item.get("module") or ""))
+    parts = [f"{int(item['order']):03d}"]
+    if module and lesson_title_needs_module(item) and normalize_name_for_comparison(module) not in normalize_name_for_comparison(lesson):
+        parts.append(module)
+    parts.append(lesson)
+    base = " - ".join(part for part in parts if part)
+    return base[:180].rstrip(" .-")
+
+
+def build_video_file_name(item: Dict[str, Any]) -> str:
+    return f"{build_content_base_name(item)}.mp4"
+
+
+def build_attachment_file_name(item: Dict[str, Any], attachment: Dict[str, Any], index: int, total: int) -> str:
+    source_name = str(attachment.get("file_name") or f"attachment-{index}")
+    source_path = Path(source_name)
+    stem = safe_display_filename(source_path.stem or f"attachment-{index}")
+    suffix = source_path.suffix or ".bin"
+    suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    base = build_content_base_name(item)
+    if stem and normalize_name_for_comparison(stem) not in normalize_name_for_comparison(base):
+        base = f"{base} - {stem}"
+    if total > 1:
+        base = f"{base} - {index:02d}"
+    base = base[:180].rstrip(" .-")
+    return f"{base}{suffix}"
+
+
+def ensure_manifest_video_names(manifest: Dict[str, Any]) -> bool:
+    changed = False
+    for item in manifest.get("items", []):
+        expected_name = build_video_file_name(item)
+        if item.get("video_file_name") != expected_name:
+            item["video_file_name"] = expected_name
+            changed = True
+    return changed
+
+
+def ensure_manifest_attachment_names(manifest: Dict[str, Any]) -> bool:
+    changed = False
+    for item in manifest.get("items", []):
+        attachments = item.get("attachments") or []
+        total = len(attachments)
+        for index, attachment in enumerate(attachments, 1):
+            expected_name = build_attachment_file_name(item, attachment, index, total)
+            if attachment.get("local_name") != expected_name:
+                if attachment.get("local_name") and not attachment.get("legacy_local_name"):
+                    attachment["legacy_local_name"] = attachment["local_name"]
+                attachment["local_name"] = expected_name
+                changed = True
+    return changed
+
+
+def find_video_file_for_item(item: Dict[str, Any], videos_dir: Path) -> Optional[Path]:
+    target_name = item.get("video_file_name")
+    if target_name:
+        target_path = videos_dir / target_name
+        if target_path.exists():
+            return target_path
+    content_id = item["content_id"]
+    legacy_matches = sorted(videos_dir.glob(f"*_{content_id}_*.mp4"))
+    if legacy_matches:
+        return legacy_matches[0]
+    return None
+
+
+def migrate_video_filenames(manifest: Dict[str, Any], videos_dir: Path) -> int:
+    renamed = 0
+    for item in manifest.get("items", []):
+        target_name = item.get("video_file_name")
+        if not target_name:
+            continue
+        target_path = videos_dir / target_name
+        if target_path.exists():
+            continue
+        legacy_matches = sorted(videos_dir.glob(f"*_{item['content_id']}_*.mp4"))
+        if not legacy_matches:
+            continue
+        legacy_matches[0].rename(target_path)
+        renamed += 1
+    return renamed
+
+
+def migrate_attachment_filenames(
+    manifest: Dict[str, Any],
+    materials_dir: Path,
+    transcripts_dir: Path,
+) -> int:
+    renamed = 0
+    for item in manifest.get("items", []):
+        attachments = item.get("attachments") or []
+        for attachment in attachments:
+            target_name = attachment.get("local_name")
+            legacy_name = attachment.get("legacy_local_name")
+            if not target_name or not legacy_name or target_name == legacy_name:
+                continue
+            legacy_path = materials_dir / legacy_name
+            target_path = materials_dir / target_name
+            if legacy_path.exists() and not target_path.exists():
+                legacy_path.rename(target_path)
+                legacy_transcript = transcripts_dir / f"{legacy_name}.txt"
+                target_transcript = transcripts_dir / f"{target_name}.txt"
+                if legacy_transcript.exists() and not target_transcript.exists():
+                    legacy_transcript.rename(target_transcript)
+                renamed += 1
+    return renamed
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -161,8 +429,8 @@ def compute_state(
     items_state: Dict[str, Any] = {}
     for item in manifest["items"]:
         content_id = item["content_id"]
-        video_files = list(videos_dir.glob(f"*_{content_id}_*.mp4"))
-        video_downloaded = bool(video_files)
+        video_file = find_video_file_for_item(item, videos_dir)
+        video_downloaded = video_file is not None
         attachments = item.get("attachments") or []
         attachment_files = [
             materials_dir / att.get("local_name", "") for att in attachments if att.get("local_name")
@@ -171,9 +439,7 @@ def compute_state(
             path.exists() and path.stat().st_size > 0 for path in attachment_files
         ) if attachments else True
 
-        video_transcribed = all(
-            (transcripts_dir / f"{vf.name}.txt").exists() for vf in video_files
-        ) if video_files else True
+        video_transcribed = (transcripts_dir / f"{video_file.name}.txt").exists() if video_file else True
         attachments_transcribed = all(
             (transcripts_dir / f"{att.get('local_name')}.txt").exists()
             for att in attachments
@@ -234,6 +500,8 @@ def extract_token_from_value(value: str) -> Optional[str]:
         data = json.loads(value)
     except Exception:
         return None
+    if not isinstance(data, dict):
+        return None
     for key in ("access_token", "accessToken", "token"):
         token = data.get(key)
         if isinstance(token, str) and len(token) > 10:
@@ -291,6 +559,7 @@ async def get_token_with_cookies(product_url: str, cookies_path: Path, timeout_s
         return None
     from playwright.async_api import async_playwright
 
+    log(f"Trying saved cookies from {cookies_path}")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, chromium_sandbox=False)
         context = await browser.new_context(viewport={"width": 1280, "height": 720})
@@ -298,12 +567,22 @@ async def get_token_with_cookies(product_url: str, cookies_path: Path, timeout_s
         cookies = sanitize_playwright_cookies(cookies)
         await context.add_cookies(cookies)
         page = await context.new_page()
-        token_task = asyncio.create_task(capture_token_from_requests(page, timeout_sec))
-        await page.goto(product_url, wait_until="networkidle")
-        await asyncio.sleep(2)
-        token = await token_task
+        probe_timeout = min(timeout_sec, 15)
+        token_task = asyncio.create_task(capture_token_from_requests(page, probe_timeout))
+        log(f"Opening course page for token capture: {product_url}")
+        await page.goto(product_url, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+
+        token = None
+        if token_task.done():
+            token = token_task.result()
         if not token:
+            log("No token captured from requests; checking browser storage")
             token = await token_from_storage(page)
+        if not token:
+            log("Saved cookies did not yield a token")
+        else:
+            log("Recovered token from saved browser session")
         await browser.close()
         return token
 
@@ -313,7 +592,7 @@ async def login_and_capture_token(
     cookies_path: Path,
     timeout_sec: int,
 ) -> str:
-    print("Opening browser for login. Please complete Google authentication...")
+    log("Opening browser for login. Please complete Google authentication...")
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -331,18 +610,22 @@ async def login_and_capture_token(
         cookies = await context.cookies()
         write_json(cookies_path, cookies)
         await browser.close()
-        print(f"Saved cookies to {cookies_path}")
+        log(f"Saved cookies to {cookies_path}")
         return token
 
 
 async def ensure_token(product_url: str, product_id: str, cookies_path: Path, timeout_sec: int) -> str:
+    log("Checking whether saved authentication is still valid")
     token = await get_token_with_cookies(product_url, cookies_path, timeout_sec)
     if token and await validate_token(token, product_id):
+        log("Saved authentication is valid")
         return token
 
+    log("Saved authentication is missing or invalid; starting interactive login")
     token = await login_and_capture_token(product_url, cookies_path, timeout_sec)
     if not await validate_token(token, product_id):
         raise RuntimeError("Token validation failed after login.")
+    log("Authentication succeeded")
     return token
 
 
@@ -354,10 +637,13 @@ async def ensure_token_system_browser(
     chrome_bin: Optional[str],
 ) -> str:
     if cookies_path.exists():
+        log(f"Trying saved cookies from {cookies_path}")
         token = await get_token_with_cookies(product_url, cookies_path, 30)
         if token and await validate_token(token, product_id):
+            log("Saved authentication is valid")
             return token
 
+    log("Loading Hotmart cookies from the local Chrome profile")
     cookies = load_cookies_from_system("hotmart.com")
     if not cookies:
         raise RuntimeError(
@@ -368,6 +654,7 @@ async def ensure_token_system_browser(
     write_json(cookies_path, cleaned)
     token = await get_token_with_cookies(product_url, cookies_path, 30)
     if token and await validate_token(token, product_id):
+        log("System browser authentication succeeded")
         return token
     raise RuntimeError(
         "Hotmart cookies loaded but token validation failed. Please open the course in Chrome and rerun."
@@ -377,6 +664,7 @@ async def ensure_token_system_browser(
 async def fetch_navigation(token: str, product_id: str) -> Dict[str, Any]:
     import aiohttp
 
+    log("Fetching course navigation")
     headers = {
         "Authorization": f"Bearer {token}",
         "x-product-id": product_id,
@@ -395,21 +683,26 @@ async def fetch_complementary_content(
     token: str,
     product_id: str,
     content_id: str,
+    product_url: str,
 ) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {token}",
         "x-product-id": product_id,
+        "Origin": "https://hotmart.com",
+        "Referer": f"{product_url}/content/{content_id}",
     }
     url = COMPLEMENTARY_URL.format(content_id=content_id)
     async with session.get(url, headers=headers) as resp:
         if resp.status in {401, 403}:
-            raise RuntimeError("Authentication failed fetching attachments. Refresh cookies and retry.")
+            raise RuntimeError(
+                f"Authentication failed fetching attachments for content {content_id} ({resp.status})."
+            )
         if resp.status != 200:
             return {}
         return await resp.json()
 
 
-def build_manifest(navigation: Dict[str, Any], product_id: str) -> Dict[str, Any]:
+def build_manifest(navigation: Dict[str, Any], product_id: str, product_url: str) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     seen = set()
 
@@ -432,6 +725,7 @@ def build_manifest(navigation: Dict[str, Any], product_id: str) -> Dict[str, Any
                 "lesson_index": page_index,
                 "has_media": bool(has_media),
                 "type": page.get("type") or "CONTENT",
+                "video_file_name": None,
                 "attachments": None,
             }
         )
@@ -450,17 +744,24 @@ def build_manifest(navigation: Dict[str, Any], product_id: str) -> Dict[str, Any
         module_name = module.get("name") or f"Module {module_index}"
         walk_pages(module_name, module_index, module.get("pages") or module.get("lessons") or [])
 
-    return {
+    manifest = {
         "product_id": product_id,
+        "product_url": product_url,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "items": items,
     }
+    ensure_manifest_video_names(manifest)
+    return manifest
 
 
 def write_content_titles(manifest: Dict[str, Any], videos_dir: Path) -> None:
     titles = {}
     for item in manifest["items"]:
-        titles[item["content_id"]] = {"module": item["module"], "lesson": item["lesson"]}
+        titles[item["content_id"]] = {
+            "module": item["module"],
+            "lesson": item["lesson"],
+            "video_file_name": item.get("video_file_name"),
+        }
     write_json(videos_dir / "content_titles.json", titles)
 
 
@@ -468,23 +769,43 @@ async def enrich_manifest_with_attachments(
     manifest: Dict[str, Any],
     token: str,
     product_id: str,
+    product_url: str,
     output_dir: Path,
+    cookies_path: Path,
 ) -> Dict[str, Any]:
     changed = False
     import aiohttp
 
-    async with aiohttp.ClientSession() as session:
-        for item in manifest["items"]:
+    total_items = len(manifest["items"])
+    log(f"Checking attachment metadata for {total_items} content items")
+    cookies = cookie_dict_from_file(cookies_path)
+    async with aiohttp.ClientSession(cookies=cookies) as session:
+        for index, item in enumerate(manifest["items"], 1):
             if item.get("attachments") is not None:
                 continue
             content_id = item["content_id"]
-            data = await fetch_complementary_content(session, token, product_id, content_id)
+            log(f"Loading attachments [{index}/{total_items}] for {content_id}")
+            try:
+                data = await fetch_complementary_content(
+                    session,
+                    token,
+                    product_id,
+                    content_id,
+                    product_url,
+                )
+            except RuntimeError as exc:
+                log(f"Skipping attachment metadata for {content_id}: {exc}")
+                item["attachments"] = []
+                changed = True
+                write_json(output_dir / "course_manifest.json", manifest)
+                continue
             attachments = []
-            for attachment in data.get("attachments", []):
+            raw_attachments = data.get("attachments", [])
+            total_attachments = len(raw_attachments)
+            for attachment_index, attachment in enumerate(raw_attachments, 1):
                 file_id = attachment.get("fileMembershipId")
                 file_name = attachment.get("fileName") or f"{file_id}.bin"
-                safe_name = safe_filename(file_name)
-                local_name = f"{item['order']:03d}_{content_id}_{safe_name}"
+                local_name = build_attachment_file_name(item, {"file_name": file_name}, attachment_index, total_attachments)
                 attachments.append(
                     {
                         "file_membership_id": file_id,
@@ -626,12 +947,10 @@ def build_transcript(
 
             out_f.write(f"\n\n## {title}\n\n")
 
-            content_id = item["content_id"]
-            video_files = sorted(videos_dir.glob(f"*_{content_id}_*.mp4"))
+            video_file = find_video_file_for_item(item, videos_dir)
             wrote_any = False
 
-            if video_files:
-                video_file = video_files[0]
+            if video_file:
                 text_path = transcripts_dir / f"{video_file.name}.txt"
                 if text_path.exists():
                     text = text_path.read_text(encoding="utf-8", errors="ignore").strip()
@@ -667,8 +986,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     from download_videos import HotmartVideoDownloader
 
     product_id = parse_product_id(args.product)
-    product_url = resolve_product_url(args.product, product_id)
     output_root = Path(args.output_dir) / product_id
+    product_url = resolve_product_url(args.product, product_id, output_root)
     videos_dir = output_root / "videos"
     materials_dir = output_root / "materials"
     transcripts_dir = output_root / "transcripts"
@@ -680,6 +999,11 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     videos_dir.mkdir(exist_ok=True)
 
+    log("Checking external dependencies")
+    ensure_dependencies(args)
+    log(f"Starting pipeline for product {product_id}")
+    log(f"Using course URL: {product_url}")
+
     if args.auth_browser == "system":
         token = await ensure_token_system_browser(
             product_url, product_id, cookies_path, args.auth_timeout, args.chrome_bin
@@ -688,13 +1012,38 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         token = await ensure_token(product_url, product_id, cookies_path, args.auth_timeout)
 
     if manifest_path.exists() and not args.refresh_manifest:
+        log(f"Using existing manifest: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
         navigation = await fetch_navigation(token, product_id)
-        manifest = build_manifest(navigation, product_id)
+        manifest = build_manifest(navigation, product_id, product_url)
+        write_json(manifest_path, manifest)
+        log(f"Wrote manifest: {manifest_path}")
+
+    if manifest.get("product_url") != product_url:
+        manifest["product_url"] = product_url
+    manifest_changed = ensure_manifest_video_names(manifest)
+    manifest_changed = ensure_manifest_attachment_names(manifest) or manifest_changed
+    if manifest_changed:
         write_json(manifest_path, manifest)
 
-    manifest = await enrich_manifest_with_attachments(manifest, token, product_id, output_root)
+    renamed_videos = migrate_video_filenames(manifest, videos_dir)
+    if renamed_videos:
+        log(f"Renamed {renamed_videos} existing video file(s) to title-based names")
+    renamed_attachments = migrate_attachment_filenames(manifest, materials_dir, transcripts_dir)
+    if renamed_attachments:
+        log(f"Renamed {renamed_attachments} existing attachment file(s) to title-based names")
+
+    manifest = await enrich_manifest_with_attachments(
+        manifest,
+        token,
+        product_id,
+        product_url,
+        output_root,
+        cookies_path,
+    )
+    if ensure_manifest_attachment_names(manifest):
+        write_json(manifest_path, manifest)
     write_json(manifest_path, manifest)
 
     content_ids_path = output_root / "content_ids.txt"
@@ -705,9 +1054,17 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
     write_content_titles(manifest, videos_dir)
 
+    log("Starting video download stage")
     downloader = HotmartVideoDownloader(product_url, output_dir=str(videos_dir), headless=True)
     downloader.content_ids = [item["content_id"] for item in manifest["items"]]
-    await downloader.run(cookies_file=str(cookies_path))
+    downloader.content_metadata = {
+        item["content_id"]: {
+            "title": item.get("lesson") or f"Content {item['content_id']}",
+            "video_file_name": item.get("video_file_name"),
+        }
+        for item in manifest["items"]
+    }
+    video_stats = await downloader.run(cookies_file=str(cookies_path))
     write_content_titles(manifest, videos_dir)
     if not list(videos_dir.glob("*.mp4")):
         raise RuntimeError("No videos downloaded. Likely auth failure; refresh cookies and retry.")
@@ -715,25 +1072,27 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
     corrupt = purge_corrupt_videos(videos_dir)
     if corrupt:
-        print(f"Re-downloading {len(corrupt)} corrupt videos...")
-        await downloader.run(cookies_file=str(cookies_path))
+        log(f"Re-downloading {len(corrupt)} corrupt videos")
+        redownload_stats = await downloader.run(cookies_file=str(cookies_path))
+        video_stats = merge_video_stats(video_stats, redownload_stats)
         write_content_titles(manifest, videos_dir)
         write_json(state_path, compute_state(manifest, videos_dir, materials_dir, transcripts_dir))
 
-    print("Downloading attachments...")
+    log("Downloading attachments")
     await download_attachments(manifest, token, materials_dir, cookies_path)
     write_json(manifest_path, manifest)
     write_json(state_path, compute_state(manifest, videos_dir, materials_dir, transcripts_dir))
 
-    print("Transcribing videos...")
+    log("Transcribing videos")
     transcribe_videos(videos_dir, transcripts_dir, retry_failed=args.retry_failed)
-    print("Transcribing attachments...")
+    log("Transcribing attachments")
     transcribe_attachments(materials_dir, transcripts_dir, retry_failed=args.retry_failed)
     write_json(state_path, compute_state(manifest, videos_dir, materials_dir, transcripts_dir))
 
-    print("Building combined transcript...")
+    log("Building combined transcript")
     build_transcript(manifest, videos_dir, materials_dir, transcripts_dir, output_file)
-    print(f"Done. Transcript saved to {output_file}")
+    log_pipeline_summary(manifest, videos_dir, materials_dir, transcripts_dir, video_stats)
+    log(f"Done. Transcript saved to {output_file}")
 
 
 def main() -> None:
